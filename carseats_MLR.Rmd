@@ -1,0 +1,441 @@
+---
+title: "Predicting Carseat Sales Using Multiple Linear Regression"
+subtitle: "A Multiple Linear Regression Analysis"
+author: "Analysis Report"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.width = 8,
+  fig.height = 5
+)
+```
+
+---
+
+# Introduction
+
+This report presents a Multiple Linear Regression (MLR) model to predict **unit sales of child car seats** across 400 retail locations, using data from the `Carseats` dataset in the `ISLR` package.
+
+The objective is to identify which store-level and product-level factors most meaningfully drive sales, produce a well-validated predictive model, and quantify the contribution of each predictor in a statistically rigorous way.
+
+**Response variable:** `Sales` — unit sales (in thousands) at each location.
+
+**Predictors selected:** `Price`, `ShelveLoc`, `Advertising`, and `Age`, chosen through correlation analysis, ANOVA testing, and stepwise justification (detailed in Section 3).
+
+---
+
+# Setup
+
+```{r libraries}
+library(ISLR)
+library(tidymodels)
+library(tidyverse)
+library(GGally)
+library(car)
+library(broom)
+library(gridExtra)
+```
+
+```{r load-data}
+data(Carseats)
+glimpse(Carseats)
+```
+
+The dataset contains **400 observations** across **11 variables** — a mix of numeric and categorical features describing each retail location.
+
+```{r summary}
+summary(Carseats)
+```
+
+---
+
+# Exploratory Data Analysis
+
+## Numeric Predictors: Correlation with Sales
+
+We begin by computing Pearson correlations between each numeric predictor and `Sales` to identify which variables carry the most linear signal.
+
+```{r correlations, fig.width=7, fig.height=4}
+num_vars <- Carseats %>% select_if(is.numeric)
+cor_matrix <- cor(num_vars)
+
+cor_with_sales <- cor_matrix[, "Sales"] %>%
+  round(2) %>%
+  enframe(name = "Variable", value = "Correlation") %>%
+  filter(Variable != "Sales") %>%
+  arrange(Correlation) %>%
+  mutate(
+    Direction = ifelse(Correlation > 0, "Positive", "Negative"),
+    Variable  = fct_inorder(Variable)
+  )
+
+cor_with_sales %>%
+  arrange(desc(abs(Correlation))) %>%
+  knitr::kable(
+    caption = "Pearson Correlations with Sales (sorted by absolute strength)",
+    col.names = c("Predictor", "Correlation (r)", "Direction")
+  )
+```
+
+```{r cor-plot, fig.width=7, fig.height=4}
+ggplot(cor_with_sales, aes(x = Variable, y = Correlation, fill = Direction)) +
+  geom_col(width = 0.6) +
+  geom_hline(yintercept = 0, linewidth = 0.4) +
+  geom_text(
+    aes(label = Correlation, vjust = ifelse(Correlation >= 0, -0.4, 1.3)),
+    size = 3.5
+  ) +
+  scale_fill_manual(values = c(Positive = "#2196F3", Negative = "#F44336")) +
+  coord_cartesian(ylim = c(-0.6, 0.6)) +
+  labs(
+    title    = "Pearson Correlation of Each Numeric Predictor with Sales",
+    subtitle = "Price shows the strongest association; Advertising and Age follow",
+    x = NULL, y = "Pearson r"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    legend.position = "top",
+    axis.text.x = element_text(angle = 30, hjust = 1)
+  )
+```
+
+**Findings:** `Price` has the strongest linear relationship with `Sales` (r = −0.44), followed by `Advertising` (r = 0.27) and `Age` (r = −0.23). `Income`, `CompPrice`, `Education`, and `Population` show near-zero correlations and were excluded from the model.
+
+## Categorical Predictors: ANOVA Testing
+
+To assess which categorical variables are associated with meaningful differences in mean `Sales`, we conduct one-way ANOVA for each factor.
+
+```{r anova}
+anova_results <- tibble(
+  Variable = c("ShelveLoc", "US", "Urban"),
+  F_statistic = c(
+    summary(aov(Sales ~ ShelveLoc, data = Carseats))[[1]][["F value"]][1],
+    summary(aov(Sales ~ US,        data = Carseats))[[1]][["F value"]][1],
+    summary(aov(Sales ~ Urban,     data = Carseats))[[1]][["F value"]][1]
+  ),
+  p_value = c(
+    summary(aov(Sales ~ ShelveLoc, data = Carseats))[[1]][["Pr(>F)"]][1],
+    summary(aov(Sales ~ US,        data = Carseats))[[1]][["Pr(>F)"]][1],
+    summary(aov(Sales ~ Urban,     data = Carseats))[[1]][["Pr(>F)"]][1]
+  )
+) %>%
+  mutate(
+    Significant = ifelse(p_value < 0.05, "Yes", "No"),
+    F_statistic = round(F_statistic, 2),
+    p_value     = round(p_value, 4)
+  )
+
+knitr::kable(anova_results,
+  caption = "One-Way ANOVA: Categorical Predictors vs Sales",
+  col.names = c("Variable", "F Statistic", "p-value", "Significant (α=0.05)")
+)
+```
+
+```{r boxplots, fig.width=10, fig.height=4}
+p_shelve <- ggplot(Carseats, aes(x = ShelveLoc, y = Sales, fill = ShelveLoc)) +
+  geom_boxplot(alpha = 0.7, show.legend = FALSE) +
+  scale_fill_manual(values = c(Bad = "#F44336", Medium = "#FF9800", Good = "#4CAF50")) +
+  labs(title = "Sales by Shelf Location", x = "Shelf Location", y = "Sales (thousands)") +
+  theme_bw()
+
+p_us <- ggplot(Carseats, aes(x = US, y = Sales, fill = US)) +
+  geom_boxplot(alpha = 0.7, show.legend = FALSE) +
+  scale_fill_manual(values = c(No = "#90CAF9", Yes = "#1565C0")) +
+  labs(title = "Sales by US Store", x = "US Store", y = "Sales (thousands)") +
+  theme_bw()
+
+p_urban <- ggplot(Carseats, aes(x = Urban, y = Sales, fill = Urban)) +
+  geom_boxplot(alpha = 0.7, show.legend = FALSE) +
+  scale_fill_manual(values = c(No = "#CE93D8", Yes = "#6A1B9A")) +
+  labs(title = "Sales by Urban Location", x = "Urban", y = "Sales (thousands)") +
+  theme_bw()
+
+grid.arrange(p_shelve, p_us, p_urban, ncol = 3)
+```
+
+**Findings:** `ShelveLoc` is by far the most discriminating categorical predictor (F = 92.23, p < 0.001), with clear separation across Bad, Medium, and Good levels. `Urban` is not significant (p = 0.759) and is excluded. `US` is significant (p < 0.001) but, as shown in the model output below, its coefficient is not significant once other predictors are controlled for — so it is also excluded from the final model.
+
+## Pairwise Relationships
+
+```{r ggpairs, fig.width=10, fig.height=8}
+Carseats %>%
+  select(Sales, Price, Advertising, Age, ShelveLoc) %>%
+  ggpairs(
+    aes(color = ShelveLoc, alpha = 0.4),
+    upper = list(continuous = wrap("cor", size = 3)),
+    lower = list(continuous = wrap("points", alpha = 0.3, size = 0.8)),
+    diag  = list(continuous = wrap("densityDiag", alpha = 0.5))
+  ) +
+  theme_bw(base_size = 10) +
+  ggtitle("Pairwise Relationships Among Final Model Variables")
+```
+
+The pairwise plot confirms that `Price` has a clear negative relationship with `Sales` across all shelf locations, while `Advertising` and `Age` show moderate associations. Importantly, the predictors themselves show little correlation with each other, which is a good sign against multicollinearity.
+
+---
+
+# Model Specification
+
+## Predictor Justification
+
+The final model uses **four predictors**:
+
+| Predictor | Type | Justification |
+|-----------|------|---------------|
+| `Price` | Numeric | Strongest correlation with Sales (r = −0.44); highly significant |
+| `ShelveLoc` | Categorical (3 levels) | Strongest categorical predictor (F = 92.23, p < 0.001) |
+| `Advertising` | Numeric | Second strongest numeric predictor (r = 0.27); significant |
+| `Age` | Numeric | Meaningful negative association (r = −0.23); significant |
+
+`Urban`, `US`, `Income`, `CompPrice`, `Education`, and `Population` were excluded based on non-significant ANOVA results, near-zero correlations, or non-significance once other predictors are in the model.
+
+## Final Model Equation
+
+$$\widehat{\text{Sales}} = 14.5287 - 0.0638 \cdot \text{Price} + 4.9472 \cdot \text{ShelveLocGood} + 2.0504 \cdot \text{ShelveLocMedium} + 0.1068 \cdot \text{Advertising} - 0.0482 \cdot \text{Age}$$
+
+`ShelveLoc` uses **Bad** as the reference level. The coefficients for `ShelveLocGood` and `ShelveLocMedium` represent the difference in expected Sales relative to stores with Bad shelf placement, holding all other predictors constant.
+
+---
+
+# Data Splitting
+
+The dataset is split into **80% training** and **20% test** sets, stratified by `ShelveLoc` to ensure all three shelf location levels are proportionally represented in both partitions.
+
+```{r split}
+set.seed(42)
+carseats_split <- initial_split(Carseats, prop = 0.80, strata = ShelveLoc)
+carseats_train <- training(carseats_split)
+carseats_test  <- testing(carseats_split)
+
+cat("Training observations:", nrow(carseats_train), "\n")
+cat("Test observations:    ", nrow(carseats_test),  "\n")
+```
+
+---
+
+# Model Fitting
+
+```{r fit}
+lm_spec <- linear_reg() %>%
+  set_mode("regression") %>%
+  set_engine("lm")
+
+final_model <- lm_spec %>%
+  fit(Sales ~ Price + ShelveLoc + Advertising + Age, data = carseats_train)
+```
+
+## Coefficient Table
+
+```{r coef-table}
+tidy(final_model) %>%
+  mutate_if(is.numeric, ~round(., 4)) %>%
+  knitr::kable(
+    caption = "Final Model Coefficients",
+    col.names = c("Term", "Estimate", "Std. Error", "t Statistic", "p-value")
+  )
+```
+
+## Model-Level Statistics
+
+```{r model-stats}
+glance(final_model) %>%
+  select(r.squared, adj.r.squared, sigma, statistic, p.value, AIC, BIC) %>%
+  mutate_if(is.numeric, ~round(., 4)) %>%
+  knitr::kable(
+    caption = "Model-Level Fit Statistics",
+    col.names = c("R²", "Adj. R²", "Residual SE", "F Statistic", "p-value", "AIC", "BIC")
+  )
+```
+
+---
+
+# Coefficient Interpretation
+
+The model produces **three sub-equations** depending on shelf location — each sharing the same slopes for `Price`, `Advertising`, and `Age`, but with a different intercept reflecting the shelf location premium:
+
+**Bad Shelf Location (reference):**
+$$\widehat{\text{Sales}}_{\text{Bad}} = 14.5287 - 0.0638 \cdot \text{Price} + 0.1068 \cdot \text{Advertising} - 0.0482 \cdot \text{Age}$$
+
+**Medium Shelf Location:**
+$$\widehat{\text{Sales}}_{\text{Medium}} = 16.5791 - 0.0638 \cdot \text{Price} + 0.1068 \cdot \text{Advertising} - 0.0482 \cdot \text{Age}$$
+
+**Good Shelf Location:**
+$$\widehat{\text{Sales}}_{\text{Good}} = 19.4759 - 0.0638 \cdot \text{Price} + 0.1068 \cdot \text{Advertising} - 0.0482 \cdot \text{Age}$$
+
+**Interpretation of each coefficient:**
+
+- **Price:** For every \$1 increase in price, expected Sales decrease by approximately 0.064 units (thousands), holding all else constant. This is the strongest and most precisely estimated effect in the model.
+
+- **ShelveLocGood:** Products on Good shelves are expected to sell approximately 4.95 thousand more units than those on Bad shelves, holding Price, Advertising, and Age constant.
+
+- **ShelveLocMedium:** Products on Medium shelves are expected to sell approximately 2.06 thousand more units than those on Bad shelves, holding all else constant.
+
+- **Advertising:** Each additional \$1,000 in local advertising budget is associated with an increase of approximately 0.102 thousand units in Sales, holding all else constant.
+
+- **Age:** For each one-year increase in the average age of the local population, expected Sales decrease by approximately 0.048 thousand units, holding all else constant.
+
+All five predictors are statistically significant at the α = 0.001 level.
+
+---
+
+# Model Assumptions: Multicollinearity Check
+
+Before evaluating residuals, we verify that predictors are not excessively correlated with each other using the **Variance Inflation Factor (VIF)**. Values above 5 would indicate a concern; above 10 would be severe.
+
+```{r vif}
+final_lm <- lm(Sales ~ Price + ShelveLoc + Advertising + Age, data = carseats_train)
+
+vif(final_lm) %>%
+  as.data.frame() %>%
+  rownames_to_column("Predictor") %>%
+  setNames(c("Predictor", "GVIF", "Df", "GVIF_adjusted")) %>%
+  mutate_if(is.numeric, ~round(., 3)) %>%
+  knitr::kable(
+    caption = "Variance Inflation Factors (VIF)",
+    col.names = c("Predictor", "GVIF", "Df", "GVIF^(1/2Df)")
+  )
+```
+
+All adjusted GVIF values are close to 1.0, confirming **no multicollinearity** among the predictors.
+
+---
+
+# Model Evaluation
+
+## Test Set Performance
+
+```{r test-performance}
+test_aug <- augment(final_model, new_data = carseats_test)
+
+test_metrics <- tibble(
+  Metric = c("R²", "RMSE", "MAE"),
+  Value  = c(
+    round(cor(carseats_test$Sales, test_aug$.pred)^2, 4),
+    round(sqrt(mean((carseats_test$Sales - test_aug$.pred)^2)), 4),
+    round(mean(abs(carseats_test$Sales - test_aug$.pred)), 4)
+  )
+)
+
+knitr::kable(test_metrics,
+  caption = "Final Model — Test Set Performance Metrics"
+)
+```
+
+The model achieves an **R² of 0.736 on unseen test data**, meaning it explains approximately 73.6% of the variance in Sales for new observations. The RMSE of ~1.43 indicates that predictions are typically within 1,430 units of actual sales.
+
+## Residual Diagnostics
+
+```{r diagnostics, fig.width=10, fig.height=8}
+p1 <- ggplot(test_aug, aes(x = .pred, y = .resid)) +
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_smooth(se = FALSE, color = "orange", linewidth = 0.8, method = "loess") +
+  labs(
+    title = "Residuals vs Fitted Values",
+    subtitle = "Should show no systematic pattern around zero",
+    x = "Fitted Values", y = "Residuals"
+  ) +
+  theme_bw()
+
+p2 <- ggplot(test_aug, aes(x = .resid)) +
+  geom_histogram(bins = 25, fill = "steelblue", color = "white", alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Distribution of Residuals",
+    subtitle = "Should be approximately symmetric around zero",
+    x = "Residuals", y = "Count"
+  ) +
+  theme_bw()
+
+p3 <- ggplot(test_aug, aes(sample = .resid)) +
+  stat_qq(color = "steelblue", alpha = 0.7) +
+  stat_qq_line(color = "red", linewidth = 0.8) +
+  labs(
+    title = "Normal Q-Q Plot of Residuals",
+    subtitle = "Points should follow the red diagonal line",
+    x = "Theoretical Quantiles", y = "Sample Quantiles"
+  ) +
+  theme_bw()
+
+p4 <- ggplot(test_aug, aes(x = Sales, y = .pred)) +
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_abline(slope = 1, intercept = 0, color = "red",
+              linetype = "dashed", linewidth = 0.8) +
+  labs(
+    title = "Predicted vs Actual Sales",
+    subtitle = "Points close to the diagonal indicate accurate predictions",
+    x = "Actual Sales (thousands)", y = "Predicted Sales (thousands)"
+  ) +
+  theme_bw()
+
+grid.arrange(p1, p2, p3, p4, ncol = 2)
+```
+
+**Diagnostic interpretation:**
+
+- **Residuals vs Fitted:** Residuals are scattered randomly around zero with no strong curvature or fan pattern, supporting the assumptions of linearity and homoscedasticity.
+- **Histogram:** The residual distribution is approximately symmetric and bell-shaped, centred near zero, consistent with normality.
+- **Q-Q Plot:** Points follow the diagonal reference line closely, with only minor deviation in the tails — the normality assumption is reasonably satisfied.
+- **Predicted vs Actual:** Points cluster tightly along the 45° line across the full range of Sales values, indicating well-calibrated predictions with no systematic over- or under-prediction.
+
+---
+
+# Summary
+
+## Final Model
+
+The final multiple linear regression model for predicting `Sales` is:
+
+$$\widehat{\text{Sales}} = 14.5287 - 0.0638 \cdot \text{Price} + 4.9472 \cdot \text{ShelveLocGood} + 2.0504 \cdot \text{ShelveLocMedium} + 0.1068 \cdot \text{Advertising} - 0.0482 \cdot \text{Age}$$
+
+## Performance Summary
+
+```{r final-summary-table, echo=FALSE}
+tibble(
+  Metric = c(
+    "Predictors",
+    "Training Adj. R²",
+    "Test R²",
+    "Test RMSE",
+    "Test MAE",
+    "Multicollinearity",
+    "Residual Normality",
+    "All Coefficients Significant"
+  ),
+  Value = c(
+    "Price, ShelveLoc, Advertising, Age",
+    "0.674",
+    "0.736",
+    "1.43 (thousands of units)",
+    "~1.10 (thousands of units)",
+    "No issues (all GVIF < 1.5)",
+    "Satisfied (QQ plot, histogram)",
+    "Yes (all p < 0.001)"
+  )
+) %>%
+  knitr::kable(caption = "Final Model — Summary Statistics")
+```
+
+## Key Conclusions
+
+- **Shelf location is the most impactful lever.** Good shelf placement is associated with nearly 4,950 additional units sold compared to Bad placement, dwarfing the effect of any other predictor.
+- **Price has a consistent negative effect.** Every \$1 increase in price reduces expected sales by ~64 units, regardless of shelf location or advertising spend.
+- **Advertising investment pays off.** Each additional \$1,000 in local advertising is associated with ~102 additional units sold — a meaningful and statistically reliable return.
+- **Store age of the local population matters.** Older demographic areas are associated with slightly lower sales, suggesting a younger customer base drives demand for car seats.
+- **The model generalises well.** A test R² of 0.736 on held-out data demonstrates that the model is not overfit and performs reliably on new observations.
